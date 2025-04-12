@@ -343,8 +343,9 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == "pose":
                 continue  # can't prune view poses, not bound to gaussians
-            # if (per_point_lr := group.get('per_point_lr')):
-            #     group['per_point_lr'] = per_point_lr[mask]
+            if (per_point_lr := group.get('per_point_lr')) is not None:
+                group['per_point_lr'] = per_point_lr[mask]
+                optimizable_tensors["per_point_lr"] = group["per_point_lr"]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -370,6 +371,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if hasattr(self, "per_point_lr"):
+            self.per_point_lr = optimizable_tensors["per_point_lr"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -381,6 +384,10 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if group["name"] == "pose":
                 continue  # can't modify view poses on densification, not bound to gaussians
+            if (per_point_lr := group.get('per_point_lr')) is not None:
+                new_per_point_lr = tensors_dict["per_point_lr"]
+                group['per_point_lr'] = nn.Parameter(torch.cat((per_point_lr, new_per_point_lr), dim=0).requires_grad_(True))
+                optimizable_tensors["per_point_lr"] = group["per_point_lr"]
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -400,13 +407,14 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_per_point_lr=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
-        "rotation" : new_rotation}
+        "rotation" : new_rotation,
+        "per_point_lr": new_per_point_lr}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -415,6 +423,8 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+        if hasattr(self, "per_point_lr"):
+            self.per_point_lr = optimizable_tensors["per_point_lr"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -439,8 +449,12 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        if hasattr(self, "per_point_lr"):
+            new_per_point_lr = self.per_point_lr[selected_pts_mask].repeat(N,1)
+        else:
+            new_per_point_lr = None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_per_point_lr)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -457,8 +471,14 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        if hasattr(self, "per_point_lr"):
+            new_per_point_lr = self.per_point_lr[selected_pts_mask]
+        else:
+            new_per_point_lr = None
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_per_point_lr,
+        )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
